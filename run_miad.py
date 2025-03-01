@@ -66,7 +66,7 @@ def main(args: argparse.Namespace) -> None:
         im_size=args.size
     )
     patchcore_save_path = os.path.join(
-                        "models", _class_
+                        "checkpoints/nn_indexes", _class_
                     )
     os.makedirs(patchcore_save_path, exist_ok=True)
     prepend = ''

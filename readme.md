@@ -30,7 +30,7 @@ Dataset should have the following structure:
 ./datasets/{dataset}/test/test_labels/Ungood/{images} #Anomalous test data GT images
 ```
 
-<a href="https://github.com/DorisBao/BMAD">Download</a> the pretarined weights of SAM (or your pretrained ones)
+<a href="https://github.com/facebookresearch/segment-anything">Download</a> the pretarined weights of SAM (or your pretrained ones)
 
 Place the weights under `./checkpoints`
 
