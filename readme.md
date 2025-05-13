@@ -1,4 +1,4 @@
-# Official implementation of MIAD-SAM (Submitted to MICCAI25)
+# Official implementation of MIAD-SAM (Submitted to BMVC25)
 
 <p align="center">
 <img src="img/MIAD-SAM.png">
