@@ -1,7 +1,7 @@
-# Official implementation of MIAD-SAM (Submitted to BMVC25)
+# Official implementation of MIAS-SAM (Submitted to BMVC25)
 
 <p align="center">
-<img src="img/MIAD-SAM.png">
+<img src="img/MIAS-SAM.png">
 </p>
 
 ## Setup and run
@@ -9,7 +9,7 @@
 1. Clone the repository
 ```bash
 git clone anonymized_link
-cd MIAD-SAM
+cd MIAS-SAM
 ```
 
 2. Install dependencies
@@ -37,7 +37,7 @@ Place the weights under `./checkpoints`
 4. Run the code!
 
 ```bash
-python3 run_miad.py
+python3 run_mias.py
 ```
 Parameters:
 ```yaml
