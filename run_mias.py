@@ -1,339 +1,285 @@
-import numpy as np
-import cv2
-import matplotlib.pyplot as plt
 import argparse
-import torch
 import os
-from tqdm import tqdm
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
 from medpy import metric
+from tqdm import tqdm
 
-from src.dataset import load_data, MedicalDataset, MedicalDatasetSeg
-from src.utils import get_sam_model, get_prompt
+from src.common import FaissNN, IdentitySampler
+from src.dataset import load_data
 from src.memory import PatchCore
-from src.common import FaissNN, IdentitySampler, GreedyCoresetSampler, ApproximateGreedyCoresetSampler
-from src.metrics import compute_imagewise_retrieval_metrics, compute_pixelwise_retrieval_metrics
+from src.metrics import (
+    compute_imagewise_retrieval_metrics,
+    compute_pixelwise_retrieval_metrics,
+)
+from src.utils import get_prompt, get_sam_model
 
 
-def main(args: argparse.Namespace) -> None:
-    save = args.save
-    _class_ = args.dataset
-    set_imgs = 0
-    img_to_plot = []
-    predictor = get_sam_model("vit_b", args.device, args.med)
-    train_dataloader, test_dataloader, use_mask = load_data(args.device, _class_, args.size)
-    
-    if not args.load:
-        print('Extracting features from train dataset...')
-        all_feat = []
-        all_feat_multi = []#[[] for _ in range(12)]
-        
-        for img, _, _, _ in tqdm(train_dataloader):
-            if set_imgs < 64:
-                img_to_plot.append(img[0].cpu())
-                set_imgs += 1
-            if len(all_feat) > 10:
-                break
-            predictor.set_image(np.asarray(img[0].cpu()))
-            features, all_features = predictor.get_image_embedding() #All_features = 12 blocks extracted
-            all_feat.append(features.cpu())
-            #all_features = [x.cpu() for x in all_features]
-            #for layer in range(12):
-            #    all_feat_multi[layer].append(all_features[layer])
-            all_feat_multi.append(None)#all_features)
+PREVIEW_GRID = 64               # 8x8 preview grids
+PREDICT_BATCH = 20
+SAMPLE_IDX = 2                  # test-set index used for feature/prompt visualizations
+NUM_SAM_MASKS = 3               # SAM returns 3 masks per prompt
+MAX_SAVED_NORMAL = 20
+MAX_SAVED_ABNORMAL = 100
+TRAIN_OUT_DIR = 'results/train_out'
 
-        #all_feat_multi = np.concatenate(all_feat_multi, axis=0)
-        
-        all_feat = np.concatenate(all_feat, axis=0)
 
-        fig, axes = plt.subplots(8, 8, figsize=(10, 10))
-        axes = axes.flatten()
-        for i in range(len(img_to_plot)):
-            axes[i].imshow(img_to_plot[i], cmap='gray')
-            axes[i].axis('off')
-        fig.savefig('results/train_out/train_set.png')
+def save_image_grid(images, path, grid_side=8):
+    fig, axes = plt.subplots(grid_side, grid_side, figsize=(10, 10))
+    axes = axes.flatten()
+    for i, img in enumerate(images):
+        axes[i].imshow(img, cmap='gray')
+        axes[i].axis('off')
+    fig.savefig(path)
+    plt.close(fig)
 
-    layers_to_extract_from = None#[5,11]
 
-    nn_method = FaissNN(True, 4)
-    sampler = IdentitySampler()#ApproximateGreedyCoresetSampler(0.5, args.device)#If big dataset
-    patchcore_instance = PatchCore(args.device)
-    patchcore_instance.load(
-        device=args.device,
-        layers_to_extract_from=layers_to_extract_from,
-        featuresampler=sampler,
+def extract_train_features(predictor, dataloader, preview_path):
+    print('Extracting features from train dataset...')
+    features, preview = [], []
+    for img, _, _, _ in tqdm(dataloader):
+        if len(preview) < PREVIEW_GRID:
+            preview.append(img[0].cpu())
+        predictor.set_image(np.asarray(img[0].cpu()))
+        feat, _ = predictor.get_image_embedding()
+        features.append(feat.cpu())
+    save_image_grid(preview, preview_path)
+    return np.concatenate(features, axis=0)
+
+
+def extract_test_features(predictor, dataloader, preview_path, save):
+    print('Extracting features from test dataset...')
+    features, labels, masks, images, filenames, preview = [], [], [], [], [], []
+    sample = {'to_seg': None, 'features': None}
+    for idx, (img, gt, label, img_path) in enumerate(tqdm(dataloader)):
+        if len(preview) < PREVIEW_GRID and label != 0:
+            preview.append(img[0].cpu())
+        labels.append(label[0])
+        masks.append(gt[0])
+        filenames.append(img_path[0])
+        images.append(np.asarray(img[0].cpu()))
+        predictor.set_image(np.asarray(img[0].cpu()))
+        feat, all_feats = predictor.get_image_embedding()
+        if idx == SAMPLE_IDX and save:
+            plt.imsave('{}/image.png'.format(TRAIN_OUT_DIR), img[0].cpu().numpy())
+            plt.imsave('{}/gt.png'.format(TRAIN_OUT_DIR),
+                       np.moveaxis(gt[0].cpu().numpy(), 0, -1)[:, :, 0], cmap='gray')
+            sample['to_seg'] = np.asarray(img[0].cpu())
+            sample['features'] = all_feats
+        features.append(feat.cpu())
+    save_image_grid(preview, preview_path)
+    return np.concatenate(features, axis=0), labels, masks, images, filenames, sample
+
+
+def build_patchcore(device, im_size):
+    patchcore = PatchCore(device)
+    patchcore.load(
+        device=device,
+        layers_to_extract_from=None,
+        featuresampler=IdentitySampler(),
         anomaly_scorer_num_nn=5,
-        nn_method=nn_method,
-        im_size=args.size
+        nn_method=FaissNN(True, 4),
+        im_size=im_size,
     )
-    patchcore_save_path = os.path.join(
-                        "checkpoints/nn_indexes", _class_
-                    )
-    os.makedirs(patchcore_save_path, exist_ok=True)
-    prepend = ''
-    
-    if args.load:
+    return patchcore
+
+
+def fit_or_load_patchcore(patchcore, features, save_path, load):
+    os.makedirs(save_path, exist_ok=True)
+    if load:
         print('Loading index....')
-        patchcore_instance.load_from_path(patchcore_save_path, prepend)
+        patchcore.load_from_path(save_path, '')
     else:
-        if layers_to_extract_from:
-            patchcore_instance.fit(all_feat_multi)
-        else:
-            patchcore_instance.fit(torch.from_numpy(all_feat))
-        
-        patchcore_instance.save_to_path(patchcore_save_path, prepend)
-    
-        del all_feat, all_feat_multi
+        patchcore.fit(torch.from_numpy(features))
+        patchcore.save_to_path(save_path, '')
+
+
+def predict_anomaly(patchcore, features, batch_size=PREDICT_BATCH):
+    print('Predicting...')
+    scores = [None] * len(features)
+    segmentations = [None] * len(features)
+    for i in tqdm(range(0, len(features), batch_size)):
+        batch = features[i:i + batch_size]
+        sc, seg = patchcore.predict(torch.from_numpy(batch))
+        scores[i:i + batch_size] = sc
+        segmentations[i:i + batch_size] = seg
+    return np.array(scores), np.array(segmentations)
+
+
+def minmax_normalize(arr):
+    lo, hi = arr.min(), arr.max()
+    return (arr - lo) / (hi - lo)
+
+
+def _sam_masks_for_prompt(predictor, segmentation, use_th):
+    """Run SAM once for a single anomaly map and accumulate its 3 masks."""
+    bbs, point, mask_prompt, th = get_prompt(segmentation)
+    totals = [np.zeros_like(segmentation) for _ in range(NUM_SAM_MASKS)]
+    if use_th:
+        for bb in bbs:
+            masks, _, _ = predictor.predict(box=bb, mask_input=mask_prompt)
+            for k in range(NUM_SAM_MASKS):
+                totals[k] += masks[k]
+    else:
+        masks, _, _ = predictor.predict(
+            point_coords=np.asarray([point]), point_labels=np.asarray([1]))
+        for k in range(NUM_SAM_MASKS):
+            totals[k] += masks[k]
+    return totals, point, th
+
+
+def save_feature_and_prompt_visualizations(predictor, sample, all_feat_test, segmentations):
+    save_feat = sample['features']
+    to_seg = sample['to_seg']
+    grid_size = int(np.sqrt(all_feat_test[0, 0].shape[0]))
+    for k in range(0, len(save_feat), 2):
+        fig, axs = plt.subplots(grid_size, grid_size, figsize=(12, 12))
+        for i in range(grid_size):
+            for j in range(grid_size):
+                axs[i, j].imshow(save_feat[k][0, i * grid_size + j].cpu(), cmap='gray')
+                axs[i, j].axis('off')
+        plt.subplots_adjust(wspace=0, hspace=0)
+        fig.savefig('{}/features_{}.png'.format(TRAIN_OUT_DIR, k + 1))
+        plt.close(fig)
+
+    predictor.set_image(to_seg)
+    totals, _, th = _sam_masks_for_prompt(predictor, segmentations[SAMPLE_IDX], use_th=True)
+    plt.imsave('{}/mask_prompt.png'.format(TRAIN_OUT_DIR),
+               segmentations[SAMPLE_IDX], cmap='gray')
+    plt.imsave('{}/segmentation_prompt.png'.format(TRAIN_OUT_DIR), th, cmap='gray')
+    for k in range(NUM_SAM_MASKS):
+        plt.imsave('{}/segmentation{}.png'.format(TRAIN_OUT_DIR, k), totals[k], cmap='gray')
+
+
+def _save_sam_figure(out_dir, fn, im, point, gt, sg, totals, score):
+    fig, axes = plt.subplots(1, 5, figsize=(25, 5))
+    axes[0].imshow(im)
+    axes[0].scatter([point[0]], [point[1]], color='red', s=10)
+    axes[0].set_title("Original Image"); axes[0].axis("off")
+    axes[1].imshow(np.moveaxis(gt.cpu().numpy(), 0, -1)[:, :, 0], cmap='gray')
+    axes[1].set_title("Ground Truth"); axes[1].axis("off")
+    axes[2].imshow(sg, cmap='gray'); axes[2].set_title("Anomaly Map"); axes[2].axis("off")
+    axes[3].imshow(totals[0], cmap='gray'); axes[3].set_title("Prediction 1"); axes[3].axis("off")
+    axes[4].imshow(totals[2], cmap='gray'); axes[4].set_title("Prediction 3"); axes[4].axis("off")
+    fig.suptitle('Score: {}'.format(score), fontsize=16)
+    plt.savefig('{}/out_{}'.format(out_dir, os.path.basename(fn)), dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def run_sam_refinement(predictor, images, anomaly_labels, masks_gt, segmentations,
+                       scores, filenames, save, save_class, use_th):
+    """Compute SAM masks for every test image and (optionally) save a capped subset."""
+    sam_masks = [[] for _ in range(NUM_SAM_MASKS)]
+    prompts = []
+    counter_normal = counter_abnormal = 0
+    out_dir = 'results/{}'.format(save_class)
+    if save:
+        os.makedirs(out_dir, exist_ok=True)
+    for im, la, gt, sg, sc, fn in zip(images, anomaly_labels, masks_gt,
+                                      segmentations, scores, filenames):
+        predictor.set_image(im)
+        totals, point, th = _sam_masks_for_prompt(predictor, sg, use_th)
+        prompts.append(th)
+        for k in range(NUM_SAM_MASKS):
+            sam_masks[k].append(np.clip(totals[k], 0, 1))
+        if save and ((la and counter_abnormal < MAX_SAVED_ABNORMAL)
+                     or (not la and counter_normal < MAX_SAVED_NORMAL)):
+            _save_sam_figure(out_dir, fn, im, point, gt, sg, totals, sc)
+            if la:
+                counter_abnormal += 1
+            else:
+                counter_normal += 1
+    return sam_masks, prompts
+
+
+def mean_dice(predictions, masks_gt, anomaly_labels):
+    total, count = 0.0, 0
+    for i, is_anomaly in enumerate(anomaly_labels):
+        if is_anomaly:
+            total += metric.binary.dc(predictions[i], masks_gt[i].cpu().detach().numpy())
+            count += 1
+    return total / count, count
+
+
+def evaluate_pixel(segmentations, masks_gt, anomaly_labels):
+    full = compute_pixelwise_retrieval_metrics(segmentations, masks_gt)['auroc']
+    print('Pixel Auroc: {}'.format(full))
+    sel = [i for i, a in enumerate(anomaly_labels) if a]
+    pro = compute_pixelwise_retrieval_metrics(
+        [segmentations[i] for i in sel],
+        [masks_gt[i] for i in sel],
+    )['auroc']
+    print('Pro Auroc: {}'.format(pro))
+
+
+def evaluate_dice(prompts, sam_masks, masks_gt, anomaly_labels):
+    print(masks_gt[0].shape)
+    dice_th, n = mean_dice(prompts, masks_gt, anomaly_labels)
+    print('Dice on th {} = {}'.format(n, dice_th))
+    for k, masks in enumerate(sam_masks):
+        dice, _ = mean_dice(masks, masks_gt, anomaly_labels)
+        print('Dice SAM {} = {}'.format(k, dice))
+
+
+def main(args):
+    os.makedirs(TRAIN_OUT_DIR, exist_ok=True)
+    predictor = get_sam_model("vit_b", args.device, args.med)
+    train_dl, test_dl, use_mask = load_data(args.device, args.dataset, args.size)
+
+    train_features = None
+    if not args.load:
+        train_features = extract_train_features(
+            predictor, train_dl, '{}/train_set.png'.format(TRAIN_OUT_DIR))
+
+    patchcore = build_patchcore(args.device, args.size)
+    save_path = os.path.join('checkpoints/nn_indexes', args.dataset)
+    fit_or_load_patchcore(patchcore, train_features, save_path, args.load)
+    del train_features
     torch.cuda.empty_cache()
 
-    print('Extracting features from test dataset...')
-    all_feat_test = []
-    all_feat_multi_test = [[] for _ in range(12)]
-    ite = 0
-    labels_gt = []
-    images_gt = []
-    filenames = []
-    masks_gt = []
-    img_to_plot = []
-    set_imgs = 0
-    extract_idx = 2
-    if use_mask:
-        for img, gt, label, img_path in tqdm(test_dataloader):
-            if set_imgs < 64 and label != 0:
-                    img_to_plot.append(img[0].cpu())
-                    set_imgs += 1
-            #if len(labels_gt) >= 10:
-            #    break
-            labels_gt.append(label[0])
-            masks_gt.append(gt[0])
-            filenames.append(img_path[0])
-            images_gt.append(np.asarray(img[0].cpu()))
-            predictor.set_image(np.asarray(img[0].cpu()))
-            features, all_features = predictor.get_image_embedding()
-            if ite == extract_idx and save:
-                plt.imsave('results/train_out/image.png', img[0].cpu().numpy())
-                plt.imsave('results/train_out/gt.png', np.moveaxis(gt[0].cpu().numpy(), 0, -1)[:,:,0], cmap='gray')
-                to_seg = np.asarray(img[0].cpu())
-                save_feat = all_features#features.cpu()
-            ite += 1
-            #all_features = [x.cpu() for x in all_features]
-            all_feat_test.append(features.cpu())
-            #all_feat_multi_test.append(all_features)
-            #for layer in range(12):
-            #    all_feat_multi_test[layer].append(all_features[layer].cpu().numpy())
-    #all_feat_multi_test = np.array(all_feat_multi_test)
-    fig, axes = plt.subplots(8, 8, figsize=(10, 10))
-    axes = axes.flatten()
-    for i in range(len(img_to_plot)):
-        axes[i].imshow(img_to_plot[i], cmap='gray')
-        axes[i].axis('off')
-    fig.savefig('results/train_out/test_set.png')
-    all_feat_test = np.concatenate(all_feat_test, axis=0)
-    print('Predicting...')
-    
-    if layers_to_extract_from:
-        scores, segmentations = patchcore_instance.predict(torch.from_numpy(all_feat_multi_test))
-    else:
-        scores = [None] * len(all_feat_test)
-        segmentations = [None] * len(all_feat_test)
-        size_eval = 20
-        for i in tqdm(range(0, len(all_feat_test), size_eval)):
-            batch = all_feat_test[i:i + size_eval]
-            sc, seg = patchcore_instance.predict(torch.from_numpy(batch))
-            scores[i:i + size_eval] = sc
-            segmentations[i:i + size_eval] = seg
+    if not use_mask:
+        print('Impossible to compute pixelwise metrics for dataset "{}", missing GT masks'
+              .format(args.dataset))
+        return
 
-    ''' Evaluation '''
-    scores = np.array(scores)
-    min_scores = scores.min(axis=-1)#.reshape(-1, 1)
-    max_scores = scores.max(axis=-1)#.reshape(-1, 1)
-    scores = (scores - min_scores) / (max_scores - min_scores)
+    all_feat_test, labels_gt, masks_gt, images_gt, filenames, sample = \
+        extract_test_features(predictor, test_dl,
+                              '{}/test_set.png'.format(TRAIN_OUT_DIR), args.save)
 
-    segmentations = np.array(segmentations)
-    min_scores = np.min(segmentations)
-    max_scores = np.max(segmentations)
-    #print(max_scores.shape)
-    segmentations = (segmentations - min_scores) / (max_scores - min_scores)
-
-
+    scores, segmentations = predict_anomaly(patchcore, all_feat_test)
+    scores = minmax_normalize(scores)
+    segmentations = minmax_normalize(segmentations)
     anomaly_labels = [x != 0 for x in labels_gt]
-    #print(anomaly_labels)
-    
-    auroc = compute_imagewise_retrieval_metrics(
-                scores, anomaly_labels
-    )["auroc"]
+
+    auroc = compute_imagewise_retrieval_metrics(scores, anomaly_labels)['auroc']
     print('Auroc: {}'.format(auroc))
-    
-    if use_mask:
-        # Compute PRO score & PW Auroc for all images
-        pixel_scores = compute_pixelwise_retrieval_metrics(
-            segmentations, masks_gt
-        )
-        full_pixel_auroc = pixel_scores["auroc"]
-        print('Pixel Auroc: {}'.format(full_pixel_auroc))
-        # Compute PRO score & PW Auroc only images with anomalies
-        sel_idxs = []
-        for i in range(len(masks_gt)):
-            if anomaly_labels[i]:
-                sel_idxs.append(i)
-        pixel_scores = compute_pixelwise_retrieval_metrics(
-            [segmentations[i] for i in sel_idxs],
-            [masks_gt[i] for i in sel_idxs],
-        )
-        anomaly_pixel_auroc = pixel_scores["auroc"]
-        print('Pro Auroc: {}'.format(anomaly_pixel_auroc))
+    evaluate_pixel(segmentations, masks_gt, anomaly_labels)
 
-    if save:
-        for k in range(0,len(save_feat), 2):
-            grid_size = int(np.sqrt(all_feat_test[0,0].shape[0]))
-            fig, axs = plt.subplots(grid_size, grid_size, figsize=(12, 12))
-            for i in range(grid_size):
-                for j in range(grid_size):
-                    axs[i, j].imshow(save_feat[k][0,i * grid_size + j].cpu(), cmap='gray')
-                    axs[i, j].axis('off') 
+    if args.save and sample['features'] is not None:
+        save_feature_and_prompt_visualizations(predictor, sample, all_feat_test, segmentations)
 
-            plt.subplots_adjust(wspace=0, hspace=0)
-            fig.savefig('results/train_out/features_{}.png'.format(k+1))
-        
-        predictor.set_image(to_seg)
-        bbs, point, mask_prompt, th = get_prompt(segmentations[extract_idx])
-        plt.imsave('results/train_out/mask_prompt.png', segmentations[extract_idx], cmap='gray')
-        total_mask0 = np.zeros_like(segmentations[0])
-        total_mask1 = np.zeros_like(segmentations[0])
-        total_mask2 = np.zeros_like(segmentations[0])
-        for j, bb in enumerate(bbs):
-            masks, confs, _ = predictor.predict(box=bb, mask_input=mask_prompt)
-            total_mask0+=masks[0]
-            total_mask1+=masks[1]
-            total_mask2+=masks[2]
-            #for i, (m, c) in enumerate(zip(masks, confs)):
-            #    plt.imsave('out/segmentations_sam_{}_{}.png'.format(j,i), m, cmap='gray')
-        plt.imsave('results/train_out/segmentation_prompt.png', th, cmap='gray')
-        plt.imsave('results/train_out/segmentation0.png', total_mask0, cmap='gray')
-        plt.imsave('results/train_out/segmentation1.png', total_mask1, cmap='gray')
-        plt.imsave('results/train_out/segmentation2.png', total_mask2, cmap='gray')
-        #plt.imsave('out/seg_diff.png', total_mask-segmentations[0], cmap='gray')
-    if use_mask:
-        sam_segmentations=[]
-        sam_segmentations1 = []
-        sam_segmentations2 = []
-        prompts = []
-        counter_normal = 0
-        counter_abnormal = 0
-        for im, la, gt, sg, sc, fn in zip(images_gt, anomaly_labels, masks_gt, segmentations, scores, filenames):
-            predictor.set_image(im)
-            bbs, point, mask_prompt, th = get_prompt(sg)
-            prompts.append(th)
-            total_mask0 = np.zeros_like(sg)
-            total_mask1 = np.zeros_like(sg)
-            total_mask2 = np.zeros_like(sg)
-            if args.use_th :
-                for j, bb in enumerate(bbs):
-                    masks, confs, _ = predictor.predict(box=bb,mask_input=mask_prompt)
-                    total_mask0+=masks[0]
-                    total_mask1+=masks[1]
-                    total_mask2+=masks[2]
-            else:
-                masks, confs, _ = predictor.predict(point_coords=np.asarray([point]), point_labels=np.asarray([1]))
-                total_mask0+=masks[0]
-                total_mask1+=masks[1]
-                total_mask2+=masks[2]
-            
-            sam_segmentations.append(np.clip(total_mask0, 0, 1))
-            sam_segmentations1.append(np.clip(total_mask1, 0, 1))
-            sam_segmentations2.append(np.clip(total_mask2, 0, 1))
-            if save and ((la and counter_abnormal < 100) or (not la and counter_normal < 20)):
-                if not os.path.isdir('results/{}'.format(_class_)):
-                    os.makedirs('results/{}'.format(_class_))
-                fig, axes = plt.subplots(1, 5, figsize=(25, 5))
-                axes[0].imshow(im)
-                axes[0].scatter([point[0]], [point[1]], color='red', s=10)
-                axes[0].set_title("Original Image")
-                axes[0].axis("off")
-
-                axes[1].imshow(np.moveaxis(gt.cpu().numpy(), 0, -1)[:,:,0], cmap='gray')
-                axes[1].set_title("Ground Truth")
-                axes[1].axis("off")
-
-                axes[2].imshow(sg, cmap='gray')
-                axes[2].set_title("Anomaly Map")
-                axes[2].axis("off")
-                
-                axes[3].imshow(total_mask0, cmap='gray')
-                axes[3].set_title("Prediction 1")
-                axes[3].axis("off")
-
-                axes[4].imshow(total_mask2, cmap='gray')
-                axes[4].set_title("Prediction 3")
-                axes[4].axis("off")
-
-                fig.suptitle('Score: {}'.format(sc), fontsize=16)
-
-                plt.savefig('results/{}/out_{}'.format(_class_, os.path.basename(fn)), dpi=300, bbox_inches="tight")
-                plt.close()
-
-                if la:
-                    counter_abnormal += 1
-                else:
-                    counter_normal += 1
-
-        tot_dice = 0
-        counter = 0
-        print(masks_gt[0].shape)
-        for i in range(len(masks_gt)):
-            if anomaly_labels[i] != 0:
-                dice = metric.binary.dc(prompts[i], masks_gt[i].cpu().detach().numpy())
-                tot_dice += dice
-                counter += 1
-        tot_dice = tot_dice / counter
-        print('Dice on th {} = {}'.format(counter,tot_dice))
-
-        tot_dice = 0
-        counter = 0
-        for i in range(len(masks_gt)):
-            if anomaly_labels[i] != 0:
-                dice = metric.binary.dc(sam_segmentations[i], masks_gt[i].cpu().detach().numpy())
-                tot_dice += dice
-                counter += 1
-        tot_dice = tot_dice / counter
-        print('Dice SAM 0 = {}'.format(tot_dice))
-        tot_dice = 0
-        counter = 0
-        for i in range(len(masks_gt)):
-            if anomaly_labels[i] != 0:
-                dice = metric.binary.dc(sam_segmentations1[i], masks_gt[i].cpu().detach().numpy())
-                tot_dice += dice
-                counter += 1
-        tot_dice = tot_dice / counter
-        print('Dice SAM 1 = {}'.format(tot_dice))
-        
-        tot_dice = 0
-        counter = 0
-        for i in range(len(masks_gt)):
-            if anomaly_labels[i] != 0:
-                dice = metric.binary.dc(sam_segmentations2[i], masks_gt[i].cpu().detach().numpy())
-                tot_dice += dice
-                counter += 1
-        tot_dice = tot_dice / counter
-        print('Dice SAM 2 = {}'.format(tot_dice))
-    else:
-        print('Impossible to compute pixelwise metrics for dataset \"{}\", missing GT masks'.format(_class_))
+    sam_masks, prompts = run_sam_refinement(
+        predictor, images_gt, anomaly_labels, masks_gt, segmentations, scores,
+        filenames, args.save, args.dataset, args.use_th)
+    evaluate_dice(prompts, sam_masks, masks_gt, anomaly_labels)
 
 
-if __name__ == "__main__":
+def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=str, default="cuda", help="The device to run on.")
-    parser.add_argument("--dataset", type=str, default="RESC", choices=['RESC', 'BRAIN', 'LIVER'], help="Data type.")
+    parser.add_argument("--dataset", type=str, default="RESC",
+                        choices=['RESC', 'BRAIN', 'LIVER'], help="Data type.")
     parser.add_argument("--size", type=int, default=256, help="Image size")
     parser.add_argument("--save", action="store_true")
     parser.add_argument("--load", action="store_true")
     parser.add_argument("--med", action="store_true")
     parser.add_argument("--use_th", action="store_true")
-    
-    args = parser.parse_args()
+    return parser.parse_args()
 
-    if args.load == True:
-        print('Evaluating {}'.format(args.dataset))
-    else:
-        print('Training {}'.format(args.dataset))
 
+if __name__ == "__main__":
+    args = parse_args()
+    print('{} {}'.format('Evaluating' if args.load else 'Training', args.dataset))
     main(args)
