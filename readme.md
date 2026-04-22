@@ -1,4 +1,6 @@
-# Official implementation of MIAS-SAM (Submitted to BMVC25)
+# Official implementation of MIAS-SAM
+
+This is the official implementation of **MIAS-SAM**, published at [BMVC 2025](https://bmva-archive.org.uk/bmvc/2025/assets/papers/Paper_1121/paper.pdf).
 
 <p align="center">
 <img src="img/MIAS-SAM.png">
@@ -53,3 +55,17 @@ load: load Faiss index
 <p align="center">
 <img src="img/res.png">
 </p>
+
+## Citation
+
+If you find this work useful, please cite:
+
+```bibtex
+@inproceedings{colussi2025miassam,
+  title     = {MIAS-SAM: Medical Image Anomaly Segmentation without thresholding},
+  author    = {Colussi, Marco and Ahmetovic, Dragan and Mascetti, Sergio},
+  booktitle = {Proceedings of the British Machine Vision Conference (BMVC)},
+  year      = {2025},
+  url       = {https://bmva-archive.org.uk/bmvc/2025/assets/papers/Paper_1121/paper.pdf}
+}
+```
